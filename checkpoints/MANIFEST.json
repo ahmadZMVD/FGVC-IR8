@@ -1,0 +1,20 @@
+{
+  "version": 1,
+  "checkpoints": [
+    {
+      "file": "step_0035539.pt",
+      "step": 35539,
+      "sha256": "4fcd01e925afc4c3a4eef98f40e40610da0e44ae1ca1f722b76681387123fc74",
+      "tag": "periodic",
+      "time": 1792852890.7075655
+    },
+    {
+      "file": "step_0035686.pt",
+      "step": 35686,
+      "sha256": "09e9d0cda07cf1da7721112dd7d603d9521bd0b4fd50ab9605df3f9761cb0713",
+      "tag": "final-evaluated",
+      "time": 1792853834.50652
+    }
+  ],
+  "latest": "step_0035686.pt"
+}
