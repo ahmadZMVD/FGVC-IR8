@@ -1,21 +1,26 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-app.py — FGVC-IR8 Web Interface
-===============================
+app.py — FGVC-IR8 Web Interface (v9.5 with Auto Port-Takeover & Live Engine Hot-Reload)
+========================================================================================
 Local HTTP server at http://127.0.0.1:8080
+- Automatically frees port 8080 on startup if a stale old Python server is still running in RAM.
+- Automatically hot-reloads `engine.py` whenever `engine.py` is modified on disk (no restart needed!).
+- Displays the active engine version badge (`v9.5`) in the top bar so you never hit a stale process.
 """
 
 import base64
+import importlib
 import io
 import json
 import os
+import subprocess
 import sys
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from PIL import Image
 
-from engine import FGVCInferenceEngine
+import engine
 
 CKPT_DIR = os.environ.get("FGVC_CKPT_DIR", "checkpoints")
 PORT = int(os.environ.get("FGVC_PORT", "8080"))
@@ -25,7 +30,7 @@ HTML_PAGE = """<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>FGVC-IR8</title>
+<title>FGVC-IR8 v9.5</title>
 <style>
   :root {
     --bg-main: #212121;
@@ -72,6 +77,23 @@ HTML_PAGE = """<!DOCTYPE html>
     backdrop-filter: blur(12px);
     border-bottom: 1px solid var(--border);
     z-index: 40;
+  }
+
+  .topbar-right {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+  }
+
+  .version-pill {
+    background: rgba(16, 163, 127, 0.18);
+    color: #34d399;
+    border: 1px solid rgba(16, 163, 127, 0.4);
+    border-radius: 999px;
+    padding: 4px 11px;
+    font-size: 11.5px;
+    font-weight: 700;
+    direction: ltr;
   }
 
   .model-switch {
@@ -553,10 +575,13 @@ HTML_PAGE = """<!DOCTYPE html>
 <body>
 
 <header class="topbar">
-  <div id="modelSwitch" class="model-switch" data-mode="pro_392" onclick="toggleModelSwitch()">
-    <div class="switch-thumb"></div>
-    <span id="optFastTxt" class="switch-opt opt-fast">سریع ۲۲۴</span>
-    <span id="optProTxt" class="switch-opt opt-pro">دقیق ۳۹۲</span>
+  <div class="topbar-right">
+    <div id="modelSwitch" class="model-switch" data-mode="pro_392" onclick="toggleModelSwitch()">
+      <div class="switch-thumb"></div>
+      <span id="optFastTxt" class="switch-opt opt-fast">سریع ۲۲۴</span>
+      <span id="optProTxt" class="switch-opt opt-pro">دقیق ۳۹۲</span>
+    </div>
+    <span id="verBadge" class="version-pill">FGVC-IR8 v9.5</span>
   </div>
   <button id="langBtn" class="lang-btn" onclick="toggleLanguage()">EN</button>
 </header>
@@ -585,7 +610,7 @@ HTML_PAGE = """<!DOCTYPE html>
     </div>
 
     <div class="composer-footer">
-      <span id="autoFeatureTag" class="auto-tag">پیش‌پردازش نوری و برش خودکار فعال</span>
+      <span id="autoFeatureTag" class="auto-tag">پیش‌پردازش نوری و برش خودکار فعال (Hot-Reload v9.5)</span>
       <div class="actions">
         <button id="clearBtn" class="btn-clear" onclick="clearImages()">پاک کردن</button>
         <button id="analyzeBtn" class="btn-run" onclick="runAnalysis()" disabled>تحلیل</button>
@@ -671,7 +696,7 @@ const I18N = {
     optPro: 'دقیق ۳۹۲',
     dropTitle: 'تصاویر خودرو را انتخاب کنید یا اینجا رها نمایید',
     dropSub: '۱ تا ۸ تصویر',
-    autoTag: 'پیش‌پردازش نوری و برش خودکار فعال',
+    autoTag: 'پیش‌پردازش نوری و برش خودکار فعال (Hot-Reload v9.5)',
     clearBtn: 'پاک کردن',
     analyzeBtn: 'تحلیل',
     prog1: 'پیش‌پردازش تصویر...',
@@ -703,7 +728,7 @@ const I18N = {
     optPro: 'Pro 392',
     dropTitle: 'Select vehicle images or drag and drop here',
     dropSub: '1 to 8 images',
-    autoTag: 'Auto-crop and exposure recovery active',
+    autoTag: 'Auto-crop and exposure recovery active (Hot-Reload v9.5)',
     clearBtn: 'Clear',
     analyzeBtn: 'Analyze',
     prog1: 'Preprocessing frames...',
@@ -941,6 +966,10 @@ function displayResults(d) {
   const sec = document.getElementById('resultsSection');
   sec.style.display = 'block';
 
+  if (d.engine_version) {
+    document.getElementById('verBadge').textContent = 'FGVC-IR8 ' + d.engine_version;
+  }
+
   document.getElementById('statusDot').className = 'status-dot ' + d.status;
   document.getElementById('verdictTitleTxt').textContent = (currentLang === 'fa') ? d.title_fa : d.title_en;
   document.getElementById('verdictConfTxt').textContent = d.final_conf_pct + '%';
@@ -1019,7 +1048,38 @@ function displayResults(d) {
 </html>
 """
 
-ENGINE_INSTANCE: FGVCInferenceEngine = None
+ENGINE_INSTANCE = None
+ENGINE_MTIME: float = 0.0
+
+
+def get_or_reload_engine():
+    global ENGINE_INSTANCE, ENGINE_MTIME
+    eng_file = os.path.abspath(engine.__file__)
+    cur_mtime = os.path.getmtime(eng_file) if os.path.exists(eng_file) else 0.0
+    if ENGINE_INSTANCE is None or (cur_mtime > ENGINE_MTIME > 0.0):
+        if ENGINE_INSTANCE is not None:
+            print(f"[HOT-RELOAD] Detected updated engine.py on disk — reloading module...")
+            importlib.reload(engine)
+        ENGINE_INSTANCE = engine.FGVCInferenceEngine(ckpt_dir=CKPT_DIR, device_str="cpu")
+        ENGINE_MTIME = cur_mtime
+    return ENGINE_INSTANCE
+
+
+def free_port_if_occupied(port: int) -> None:
+    """Terminates any stale background python server holding port 8080 on Windows/Linux."""
+    my_pid = os.getpid()
+    if os.name == "nt":
+        try:
+            out = subprocess.check_output(["netstat", "-ano"], text=True, errors="ignore")
+            for line in out.splitlines():
+                if f":{port}" in line and "LISTENING" in line:
+                    parts = line.split()
+                    pid = int(parts[-1])
+                    if pid != my_pid and pid > 0:
+                        print(f"[PORT-GUARD] Terminating stale server process PID={pid} on port {port}...")
+                        subprocess.run(["taskkill", "/F", "/PID", str(pid)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except Exception:
+            pass
 
 
 class DashboardHandler(BaseHTTPRequestHandler):
@@ -1029,6 +1089,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
     def do_GET(self):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
         self.end_headers()
         self.wfile.write(HTML_PAGE.encode("utf-8"))
 
@@ -1038,6 +1099,7 @@ class DashboardHandler(BaseHTTPRequestHandler):
             self.end_headers()
             return
         try:
+            eng = get_or_reload_engine()
             length = int(self.headers.get("Content-Length", "0"))
             body = json.loads(self.rfile.read(length).decode("utf-8"))
             b64_list = body.get("images", [])
@@ -1049,13 +1111,15 @@ class DashboardHandler(BaseHTTPRequestHandler):
                 im = Image.open(io.BytesIO(base64.b64decode(raw_b64))).convert("RGB")
                 pil_imgs.append(im)
 
-            res = ENGINE_INSTANCE.predict(pil_imgs, model_mode=model_mode)
+            res = eng.predict(pil_imgs, model_mode=model_mode)
             cropped_cnt = sum(1 for f in res["frames"] if f["is_auto_cropped"])
-            print(f"[PREDICT] mode={model_mode} frames={res['n_frames']} cropped={cropped_cnt} "
+            ver = res.get("engine_version", "v9.5")
+            print(f"[PREDICT {ver}] mode={model_mode} frames={res['n_frames']} cropped={cropped_cnt} "
                   f"status={res['status']} max_cos={res['max_cosine']:.4f} conf={res['final_conf_pct']}% time={res['elapsed_ms']}ms")
             payload = json.dumps(res, ensure_ascii=False).encode("utf-8")
             self.send_response(200)
             self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(payload)
         except Exception as e:
@@ -1068,11 +1132,11 @@ class DashboardHandler(BaseHTTPRequestHandler):
 
 
 def main():
-    global ENGINE_INSTANCE
-    ENGINE_INSTANCE = FGVCInferenceEngine(ckpt_dir=CKPT_DIR, device_str="cpu")
+    free_port_if_occupied(PORT)
+    eng = get_or_reload_engine()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), DashboardHandler)
     url = f"http://127.0.0.1:{PORT}"
-    print(f"[SERVER] FGVC-IR8 listening on {url}")
+    print(f"[SERVER] FGVC-IR8 {eng.version} listening on {url}")
     print("[SERVER] Press Ctrl+C to stop.")
     try:
         webbrowser.open(url)
